@@ -7,7 +7,7 @@ import shutil
 # --- Global Configuration ---
 ORIGINAL_PAPERS_DIR = Path("original_paper_files")
 
-class DocumentProcessingUtils:
+class FileHandler:
     """
     A utility class for handling document downloads and file management.
     """
@@ -49,6 +49,7 @@ class DocumentProcessingUtils:
         Processes a list of URLs or uploaded files.
         """
         results = []
+        paths = []
         for input_value in inputs:
             source_type = input_value.get("type")
             value = input_value.get("value")
@@ -58,6 +59,7 @@ class DocumentProcessingUtils:
 
             if source_type.lower() == "url":
                 result = self.download_file_from_url(value)
+                paths.append(result)
                 if result:
                     results.append(f"Successfully processed URL: {value}")
                 else:
@@ -74,7 +76,8 @@ class DocumentProcessingUtils:
                 if not local_path.exists():
                     shutil.copy(file_path, local_path)
                     results.append(f"Successfully processed and saved PDF: {file_path.name}")
+                    paths.append(local_path)
                 else:
                     results.append(f"PDF file {file_path.name} already exists. Skipping.")
 
-        return "\n".join(results)
+        return paths
