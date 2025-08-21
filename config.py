@@ -1,0 +1,5 @@
+LLM_MODEL_NAME = "llama3.2:3b"
+EMBEDDING_MODEL_NAME = "nomic-embed-text"
+CHROMA_DB_PATH = "chroma_db"
+VECTOR_SEARCH_K = 8
+HYBRID_RETRIEVER_WEIGHTS = (0.5, 0.5)

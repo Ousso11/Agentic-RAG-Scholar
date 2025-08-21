@@ -1,9 +1,25 @@
+# --- Core Frameworks ---
+langchain==0.3.27
+langchain-community==0.3.27
+langgraph==0.6.6
+
+# --- Vector DB + Embeddings ---
+chromadb==1.0.20
+llama-index==0.13.2
+llama-index-embeddings-ollama==0.8.1
+llama-index-llms-ollama==0.7.1
+
+# --- Document Processing ---
+docling==2.46.0
+
+# --- Frontend ---
 gradio==5.43.1
+
+# --- Utilities ---
 requests
-chromadb
-llama-index
-llama-index-embeddings-ollama
-llama-index-llms-ollama
-langchain
-langgraph
-docling
+
+# --- Recommended optional dependencies for LangChain/Index integrations ---
+tiktoken        # tokenizer (used by LangChain & LlamaIndex)
+pydantic        # required by LangChain 0.3.x
+numpy            # required by Chroma
+duckduckgo-search==8.1.1 # for web search tools

@@ -1,56 +1,37 @@
+# retriever.py
+import logging
 from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
-from ibm_watsonx_ai.metanames import EmbedTextParamsMetaNames
-from langchain_ibm import WatsonxEmbeddings
+from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
-from config.settings import settings
-import logging
 
 logger = logging.getLogger(__name__)
 
 class RetrieverBuilder:
-    def __init__(self):
-        """Initialize the retriever builder with embeddings."""
-        embed_params = {
-            EmbedTextParamsMetaNames.TRUNCATE_INPUT_TOKENS: 3,
-            EmbedTextParamsMetaNames.RETURN_OPTIONS: {"input_text": True},
-        }
+    def __init__(self, embedding_model_name: str, persist_dir: str, k: int = 8, weights=(0.5, 0.5)):
+        self.embeddings = OllamaEmbeddings(model=embedding_model_name)
+        self.persist_dir = persist_dir
+        self.k = k
+        self.weights = list(weights)
 
-        watsonx_embedding = WatsonxEmbeddings(
-            model_id="ibm/slate-125m-english-rtrvr",
-            url="https://us-south.ml.cloud.ibm.com",
-            project_id="skills-network",
-            params=embed_params
-        )
-        self.embeddings = watsonx_embedding
-        
     def build_hybrid_retriever(self, docs):
-        """Build a hybrid retriever using BM25 and vector-based retrieval."""
         try:
-            # Create Chroma vector store
             vector_store = Chroma.from_documents(
                 documents=docs,
                 embedding=self.embeddings,
-                persist_directory=settings.CHROMA_DB_PATH
+                persist_directory=self.persist_dir
             )
-            logger.info("Vector store created successfully.")
-            
-            # Create BM25 retriever
+            logger.info("Vector store created.")
+
             bm25 = BM25Retriever.from_documents(docs)
-            logger.info("BM25 retriever created successfully.")
-            
-            # Create vector-based retriever
-            vector_retriever = vector_store.as_retriever(search_kwargs={"k": settings.VECTOR_SEARCH_K})
-            logger.info("Vector retriever created successfully.")
-            
-            # Combine retrievers into a hybrid retriever
-            hybrid_retriever = EnsembleRetriever(
+            vector_retriever = vector_store.as_retriever(search_kwargs={"k": self.k})
+
+            hybrid = EnsembleRetriever(
                 retrievers=[bm25, vector_retriever],
-                weights=settings.HYBRID_RETRIEVER_WEIGHTS
+                weights=self.weights
             )
-            logger.info("Hybrid retriever created successfully.")
-            return hybrid_retriever
+            logger.info("Hybrid retriever ready.")
+            return hybrid
         except Exception as e:
             logger.error(f"Failed to build hybrid retriever: {e}")
             raise

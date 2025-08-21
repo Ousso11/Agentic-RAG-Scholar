@@ -1,20 +1,30 @@
 import gradio as gr
 from ollama_engine import ollama_setup
 from agents.workflow import WorkflowGraph
-LLM_MODEL_NAME = "llama3.2:3b"
-EMBEDDING_MODEL_NAME = "nomic-embed-text"
+from config import (LLM_MODEL_NAME, 
+                    EMBEDDING_MODEL_NAME,
+                    CHROMA_DB_PATH,
+                    VECTOR_SEARCH_K,
+                    HYBRID_RETRIEVER_WEIGHTS)
 
 
 def setup_ollama_on_load():
     try:
         ollama_setup(LLM_MODEL_NAME)
-        # ollama_setup(EMBEDDING_MODEL_NAME)
+        ollama_setup(EMBEDDING_MODEL_NAME)
         gr.Info("✅ Ollama setup complete!")
     except Exception as e:
         gr.Warning(f"⚠️ Ollama setup error: {e}")
 
 def main():
-    workflow = WorkflowGraph()
+    wf = WorkflowGraph(
+    llm_model_name=LLM_MODEL_NAME,
+    embedding_model_name=EMBEDDING_MODEL_NAME,
+    chroma_dir=CHROMA_DB_PATH,
+    vector_k=VECTOR_SEARCH_K,
+    retriever_weights=HYBRID_RETRIEVER_WEIGHTS,
+    )
+    
     with gr.Blocks(title="Document Processor") as demo:
         gr.Markdown("# 📄 Multi-Document Processor")
 
@@ -121,7 +131,12 @@ def main():
                 print("No valid inputs provided.")
                 return "⚠️ Please provide at least one valid input."
 
-            workflow.pipeline(query, files)
+            state = wf.run(question=query, files=files)
+            # display concise log
+            rel = state.get("relevance")
+            if rel == "CAN_ANSWER":
+                return f"✅ Answered from uploaded docs.\n\n{state.get('final_answer','')}"
+            return f"🌐 Used web search (Reflexion). Relevance={rel}\n\n{state.get('final_answer','')}"
 
         submit_btn.click(
             fn=handle_submission,
