@@ -1,0 +1,9 @@
+gradio==5.43.1
+requests
+chromadb
+llama-index
+llama-index-embeddings-ollama
+llama-index-llms-ollama
+langchain
+langgraph
+docling
