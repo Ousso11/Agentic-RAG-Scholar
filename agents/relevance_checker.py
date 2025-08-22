@@ -113,7 +113,7 @@ Passages:
                 result = RelevanceResult.parse_obj(result)
                 
             # Enforce logical consistency & clamp numeric ranges defensively
-            result.can_answer = result.label == "CAN_ANSWER"
+            result.can_answer = result.label == "CAN_ANSWER" or result.label == "PARTIAL"
             result.relevance = max(0, min(5, int(result.relevance)))
             result.confidence = max(0, min(5, int(result.confidence)))
 

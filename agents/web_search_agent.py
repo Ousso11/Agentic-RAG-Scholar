@@ -14,11 +14,10 @@ from langgraph.graph import StateGraph, END
 
 from langchain_core.pydantic_v1 import BaseModel, Field
 
-
 # ------------------------- Structured Schemas ------------------------- #
 class Reflection(BaseModel):
-    missing: str = Field(description="What information is missing")
-    superfluous: str = Field(description="What information is unnecessary")
+    missing: List[str] = Field(description="What information is missing")
+    superfluous: List[str] = Field(description="What information is unnecessary")
 
 
 class AnswerQuestion(BaseModel):
@@ -29,11 +28,12 @@ class AnswerQuestion(BaseModel):
 
 class ReviseAnswer(AnswerQuestion):
     """Revise your original answer to your question."""
-    references: List[str] = Field(
+    references: List[Dict[str, str]] = Field(
         description="Citations motivating your updated answer."
     )
 
- # ---------- Build LangGraph ---------- #
+
+# ---------- Build LangGraph ---------- #
 class GraphState(TypedDict, total=False):
     question: str
     query: str
@@ -42,6 +42,7 @@ class GraphState(TypedDict, total=False):
     answer: AnswerQuestion
     revised: ReviseAnswer
     conversation: List[Dict]
+
 
 # ------------------------- Memory ------------------------- #
 class ReflectionMemory:
@@ -93,22 +94,34 @@ class WebSearchAgent:
         graph.set_entry_point("search")
         graph.add_edge("search", "respond")
         graph.add_edge("respond", "revise")
-        graph.add_conditional_edges("revise", self.should_continue, {"search": "search", "end": END})
+        graph.add_conditional_edges("revise", self.should_continue, {
+            "search": "search",
+            "respond": "respond",
+            "end": END
+        })
+
         graph.add_edge("respond", END)
 
         self.graph = graph.compile()
 
 
     def build_responder_chain(self):
-        # ---------- Build responder chain (AnswerQuestion) ---------- #
         self.answer_parser = JsonOutputParser(pydantic_object=AnswerQuestion)
         responder_tmpl = (
-            """
+    """
 You are a research assistant. Given a user question, recent reflections, and search snippets,
-write a concise, factual answer. Be specific. Then self-critique: what is missing and what is unnecessary?
+write a concise, factual answer. Be specific.
+
+Then perform a self-critique. The self-critique MUST be returned as an object with exactly two fields:
+- "missing": what information is missing
+- "superfluous": what information is unnecessary
+
 Finally, propose up to 3 concrete search queries to fill gaps or verify claims.
 
-Return ONLY JSON matching this schema:
+⚠️ CRITICAL INSTRUCTION: Return ONLY valid JSON. 
+Do not include any commentary, explanations, or text outside the JSON. 
+Do not repeat the self-critique separately. 
+Output must match this schema exactly:
 {format_instructions}
 
 User Question:
@@ -119,8 +132,9 @@ Recent Reflections:
 
 Search Results (first 8, JSON):
 {results_json}
-            """
-        ).strip()
+    """
+).strip()
+        
         self.responder_prompt = PromptTemplate(
             template=responder_tmpl,
             input_variables=["question", "reflections", "results_json"],
@@ -129,7 +143,6 @@ Search Results (first 8, JSON):
         self.responder_chain = self.responder_prompt | self.llm | self.answer_parser
 
     
-    # ---------- Build revisor chain (ReviseAnswer) ---------- #
     def build_revisor_chain(self):
         self.revise_parser = JsonOutputParser(pydantic_object=ReviseAnswer)
         revisor_tmpl = (
@@ -182,13 +195,18 @@ Search Results (JSON):
         return normalized
 
     def node_search(self, state: GraphState) -> GraphState:
-        
+        self.logger.info(f"Search iteration {state.get('iteration', 0) + 1}")
         q = state.get("query") or state["question"]
         results = self._run_tool(q)
         conv = state.get("conversation", []) + [{"action": "search", "query": q, "results": results}]
+        self.logger.info(f" - Retrieved {len(results)} results")
         return {**state, "results": results, "conversation": conv}
 
     def node_respond(self, state: GraphState) -> GraphState:
+        # Increment iteration here
+        i = state.get("iteration", 0) + 1
+        self.logger.info(f"Respond iteration {i}")
+
         results_json = json.dumps(state.get("results", [])[:8], indent=2)
         reflections = self.memory.dump()
         answer = self.responder_chain.invoke(
@@ -198,17 +216,30 @@ Search Results (JSON):
                 "results_json": results_json,
             }
         )
-        # --- FIX: Ensure we always have a Pydantic object
-        if isinstance(answer, dict):
+
+        # Ensure safe defaults
+        if answer is None:
+            answer = AnswerQuestion(
+                answer="No answer generated",
+                reflection=Reflection(missing=[], superfluous=[]),
+                search_queries=[]
+            )
+        elif isinstance(answer, dict):
             answer = AnswerQuestion.parse_obj(answer)
+
+        # --- LOG GENERATED ANSWER AND TOP RESULTS ---
+        self.logger.info(f"Generated Answer:\n{answer.answer}")
+        self.logger.info(f"Top Search Results:\n{results_json}")
 
         self.memory.add(
             f"Missing: {answer.reflection.missing} | Superfluous: {answer.reflection.superfluous}"
         )
         conv = state.get("conversation", []) + [{"action": "respond", "answer": answer.dict()}]
-        return {**state, "answer": answer, "conversation": conv}
+        self.logger.info(f" - Answer generated with {len(answer.search_queries)} search queries")
+        return {**state, "answer": answer, "conversation": conv, "iteration": i}
 
     def node_revise(self, state: GraphState) -> GraphState:
+        self.logger.info("Revising answer...")
         results_json = json.dumps(state.get("results", [])[:8], indent=2)
         reflections = self.memory.dump()
         original_answer_json = state["answer"].json()
@@ -220,31 +251,53 @@ Search Results (JSON):
                 "results_json": results_json,
             }
         )
+
+        # Ensure safe defaults
+        if revised is None:
+            revised = ReviseAnswer(
+                answer="No revised answer generated",
+                reflection=Reflection(missing=[], superfluous=[]),
+                search_queries=[],
+                references=[]
+            )
+        elif isinstance(revised, dict):
+            reflection = revised.get("reflection", {})
+            filtered_reflection = {
+                "missing": reflection.get("missing", []),
+                "superfluous": reflection.get("superfluous", [])
+            }
+            revised["reflection"] = filtered_reflection
+            revised = ReviseAnswer.parse_obj(revised)
+
+        # --- LOG REVISED ANSWER AND TOP RESULTS ---
+        self.logger.info(f"Revised Answer:\n{revised.answer}")
+        self.logger.info(f"Top Search Results for Revision:\n{results_json}")
+
         conv = state.get("conversation", []) + [{"action": "revise", "revised": revised.dict()}]
+        self.logger.info(f" - Revised answer generated with {len(revised.search_queries)} search queries")
         return {**state, "revised": revised, "conversation": conv}
 
-    def should_continue(self, state: GraphState) -> Literal["search", "end"]:
-        i = int(state.get("iteration", 0))
-        if i + 1 >= self.max_iters:
+    def should_continue(self, state: GraphState) -> Literal["search", "respond", "end"]:
+        self.logger.info(f"Checking if should continue...")
+        i = state.get("iteration", 0)
+        if i >= self.max_iters:
             return "end"
+
+        revised = state.get("revised")
         queries = []
-        if "revised" in state and state["revised"].search_queries:
-            queries = state["revised"].search_queries
-        elif "answer" in state and state["answer"].search_queries:
-            queries = state["answer"].search_queries
+        if revised and hasattr(revised, "search_queries"):
+            queries = revised.search_queries
+
         if queries:
             return "search"
+
+        if revised:
+            return "respond"
+
         return "end"
-        
+
     # ------------------------- Public API ------------------------- #
     def run(self, question: str) -> Dict:
-        """
-        Execute the LangGraph. Returns a dict with keys:
-        - question (the original question)
-        - conversation (full sequence of steps with queries, answers, revisions)
-        - citations (all references aggregated from revised answers)
-        - final_answer (string from the latest revised answer, or responder if no revision)
-        """
         initial_state = {
             "question": question,
             "query": question,

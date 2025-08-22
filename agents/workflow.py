@@ -7,6 +7,7 @@ import logging
 from document_processing.file_handler import FileHandler
 from document_processing.document_processor import DocumentProcessor
 from agents.retriever import RetrieverBuilder
+from agents.synthesis_agent import DocSynthesisAgent
 from agents.relevance_checker import RelevanceChecker
 from agents.web_search_agent import WebSearchAgent
 from config import WEB_SEARCH_AGENT_K, VECTOR_SEARCH_K
@@ -39,6 +40,7 @@ class WorkflowGraph:
         self.logger = logger or logging.getLogger(__name__)
         self.file_handler = FileHandler(logger=self.logger)
         self.doc_processor = DocumentProcessor(logger=self.logger)
+        self.doc_synth_agent = None
         self.retriever_builder = RetrieverBuilder(
             embedding_model_name=embedding_model_name,
             persist_dir=chroma_dir,
@@ -103,7 +105,13 @@ class WorkflowGraph:
 
     def _build_retriever(self, state: AgentState) -> AgentState:
         docs = state.get("documents") or []
-        state["retriever"] = self.retriever_builder.build_hybrid_retriever(docs) if docs else None
+        if docs:
+            retriever = self.retriever_builder.build_hybrid_retriever(docs)
+            state["retriever"] = retriever
+            # init doc synthesis agent with same LLM as relevance checker
+            self.doc_synth_agent = DocSynthesisAgent(self.relevance_checker.llm, retriever, logger=self.logger)
+        else:
+            state["retriever"] = None
         return state
 
     def _check_relevance(self, state: AgentState) -> AgentState:
@@ -115,12 +123,16 @@ class WorkflowGraph:
         return state
 
     def _answer_from_docs(self, state: AgentState) -> AgentState:
-        # Minimal—fetch top docs and stitch a draft. You can replace with a SynthesisAgent.
-        retriever = state["retriever"]
-        top_docs = retriever.invoke(state["question"]) if retriever else []
-        ctx = "\n\n".join(d.page_content for d in top_docs[:VECTOR_SEARCH_K])
-        state["final_answer"] = f"Answer based on uploaded documents:\n\n{ctx}"
+        if not self.doc_synth_agent:
+            state["final_answer"] = "No documents available for answering."
+            return state
+
+        result = self.doc_synth_agent.run(state["question"])
+        state["final_answer"] = result["final_answer"]
+        state["citations"] = result.get("citations", [])
+        state["doc_results"] = result.get("conversation", [])
         return state
+
 
     def _web_search_agent(self, state: AgentState) -> AgentState:
         q = state["question"]
