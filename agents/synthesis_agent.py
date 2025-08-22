@@ -4,7 +4,7 @@ import logging
 from typing import List, Dict, Optional, TypedDict, Literal
 from langchain.schema import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
 
@@ -42,12 +42,6 @@ class ReviseAnswer(BaseModel):
 # -------- Main Agent --------
 class DocSynthesisAgent:
     def __init__(self, llm, retriever, max_iters: int = 2, logger: logging.Logger = None):
-        """
-        Args:
-            llm: LangChain-compatible chat model.
-            retriever: LangChain retriever object.
-            max_iters: Max reflection cycles.
-        """
         self.llm = llm
         self.retriever = retriever
         self.max_iters = max_iters
@@ -55,36 +49,54 @@ class DocSynthesisAgent:
 
         self.responder_chain = self._build_responder_chain()
         self.revisor_chain = self._build_revisor_chain()
-
         self.graph = self._build_graph()
 
     # ---- LLM Chains ----
     def _build_responder_chain(self):
-        prompt = ChatPromptTemplate.from_template(
-            """You are answering a question from retrieved documents.
+        parser = JsonOutputParser(pydantic_object=AnswerQuestion)
+
+        template = """
+You are answering a question from retrieved documents.
+
+Return ONLY valid JSON strictly matching this schema:
+{format_instructions}
+
+Rules:
+- No explanations outside JSON.
+- `answer` must be plain text.
+- `reflection.missing` and `reflection.superfluous` must be arrays of strings.
+- `search_queries` must be an array of strings.
 
 Question:
 {question}
 
 Retrieved context:
 {context}
+        """.strip()
 
-Task:
-1. Draft the best possible answer.
-2. Reflect on your draft:
-   - What important points are missing?
-   - What details are irrelevant?
-   - What new search/retrieval queries could help improve it?
-
-Return JSON matching AnswerQuestion schema.
-"""
+        prompt = ChatPromptTemplate.from_template(
+            template,
+            partial_variables={"format_instructions": parser.get_format_instructions()},
         )
-        return prompt | self.llm | PydanticOutputParser(pydantic_object=AnswerQuestion)
+        return prompt | self.llm | parser
 
     def _build_revisor_chain(self):
-        prompt = ChatPromptTemplate.from_template(
-            """You previously answered:
+        parser = JsonOutputParser(pydantic_object=ReviseAnswer)
 
+        template = """
+You are revising a previously drafted answer using new retrieved context.
+
+Return ONLY valid JSON strictly matching this schema:
+{format_instructions}
+
+Rules:
+- No explanations outside JSON.
+- `answer` must be plain text.
+- `references` is an array of strings (citations if applicable).
+- `reflection.missing` and `reflection.superfluous` must be arrays of strings.
+- `search_queries` must be an array of strings.
+
+Previous answer:
 {prev_answer}
 
 Reflection:
@@ -93,12 +105,13 @@ Reflection:
 
 New retrieved context:
 {context}
+        """.strip()
 
-Revise the answer if needed.
-Return JSON matching ReviseAnswer schema.
-"""
+        prompt = ChatPromptTemplate.from_template(
+            template,
+            partial_variables={"format_instructions": parser.get_format_instructions()},
         )
-        return prompt | self.llm | PydanticOutputParser(pydantic_object=ReviseAnswer)
+        return prompt | self.llm | parser
 
     # ---- Graph Nodes ----
     def node_retrieve(self, state: GraphState) -> GraphState:
@@ -110,7 +123,14 @@ Return JSON matching ReviseAnswer schema.
 
     def node_respond(self, state: GraphState) -> GraphState:
         ctx = "\n\n".join(d.page_content for d in state.get("results", [])[:5])
-        answer = self.responder_chain.invoke({"question": state["question"], "context": ctx})
+        try:
+            answer = self.responder_chain.invoke({"question": state["question"], "context": ctx})
+            if isinstance(answer, dict):
+                answer = AnswerQuestion(**answer)
+        except Exception as e:
+            self.logger.error(f"[DocSynth] Responder parse error: {e}")
+            answer = AnswerQuestion(answer="", reflection=Reflection(), search_queries=[])
+
         self.logger.info(f"[DocSynth] Draft answer: {answer.answer[:200]}...")
         i = state.get("iteration", 0) + 1
         conv = state.get("conversation", []) + [{"action": "respond", "answer": answer.dict()}]
@@ -121,12 +141,19 @@ Return JSON matching ReviseAnswer schema.
         if not prev:
             return state
         ctx = "\n\n".join(d.page_content for d in state.get("results", [])[:5])
-        revised = self.revisor_chain.invoke({
-            "prev_answer": prev.answer,
-            "missing": prev.reflection.missing,
-            "superfluous": prev.reflection.superfluous,
-            "context": ctx
-        })
+        try:
+            revised = self.revisor_chain.invoke({
+                "prev_answer": prev.answer,
+                "missing": prev.reflection.missing,
+                "superfluous": prev.reflection.superfluous,
+                "context": ctx
+            })
+            if isinstance(revised, dict):
+                revised = ReviseAnswer(**revised)
+        except Exception as e:
+            self.logger.error(f"[DocSynth] Revisor parse error: {e}")
+            revised = ReviseAnswer(answer=prev.answer, references=[], reflection=Reflection(), search_queries=[])
+
         self.logger.info(f"[DocSynth] Revised answer: {revised.answer[:200]}...")
         conv = state.get("conversation", []) + [{"action": "revise", "revised": revised.dict()}]
         return {**state, "revised": revised, "conversation": conv}
