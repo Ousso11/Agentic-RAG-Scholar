@@ -8,6 +8,7 @@ chromadb==1.0.20
 llama-index==0.13.2
 llama-index-embeddings-ollama==0.8.1
 llama-index-llms-ollama==0.7.1
+rank_bm25==0.2.2
 
 # --- Document Processing ---
 docling==2.46.0
@@ -23,3 +24,6 @@ tiktoken        # tokenizer (used by LangChain & LlamaIndex)
 pydantic        # required by LangChain 0.3.x
 numpy            # required by Chroma
 duckduckgo-search==8.1.1 # for web search tools
+
+
+termcolor==3.1.0

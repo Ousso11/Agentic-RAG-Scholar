@@ -1,17 +1,15 @@
 # workflow_graph.py
 from __future__ import annotations
-import logging
 from typing import TypedDict, List, Optional
 from langgraph.graph import StateGraph, END
 from langchain.schema import Document
-
+import logging
 from document_processing.file_handler import FileHandler
 from document_processing.document_processor import DocumentProcessor
 from agents.retriever import RetrieverBuilder
 from agents.relevance_checker import RelevanceChecker
 from agents.web_search_agent import WebSearchAgent
-
-logger = logging.getLogger(__name__)
+from config import WEB_SEARCH_AGENT_K, VECTOR_SEARCH_K
 
 # -------- State --------
 class AgentState(TypedDict, total=False):
@@ -20,11 +18,12 @@ class AgentState(TypedDict, total=False):
     files: List[dict]                 # [{type: "url"|"pdf", value: "..."}]
     # artifacts
     paths: List[str]
-    documents: List[Document]
     retriever: object
+    documents: List[Document]
     relevance: str                    # CAN_ANSWER | PARTIAL | NO_MATCH
     web_results: List[dict]
     final_answer: str
+    citations: List[str]
 
 # -------- Orchestrator --------
 class WorkflowGraph:
@@ -35,18 +34,24 @@ class WorkflowGraph:
         chroma_dir: str,
         vector_k: int = 8,
         retriever_weights=(0.5, 0.5),
+        logger: logging.Logger = None,
     ):
-        self.file_handler = FileHandler()
-        self.doc_processor = DocumentProcessor()
+        self.logger = logger or logging.getLogger(__name__)
+        self.file_handler = FileHandler(logger=self.logger)
+        self.doc_processor = DocumentProcessor(logger=self.logger)
         self.retriever_builder = RetrieverBuilder(
             embedding_model_name=embedding_model_name,
             persist_dir=chroma_dir,
             k=vector_k,
             weights=retriever_weights,
+            logger=self.logger
         )
-        self.checker = RelevanceChecker(model_name=llm_model_name)
-        self.web_agent = WebSearchAgent(llm_model_name)
+        self.relevance_checker = RelevanceChecker(model_name=llm_model_name, logger=self.logger)
+        self.web_agent = WebSearchAgent(llm_model_name, logger=self.logger)
 
+        self.build_workflow()
+        
+    def build_workflow(self):
         # Build the graph
         graph = StateGraph(AgentState)
 
@@ -84,15 +89,16 @@ class WorkflowGraph:
     # ---- node fns ----
     def _ingest_files(self, state: AgentState) -> AgentState:
         files = state.get("files", [])
-        paths = self.file_handler.process_documents(files)
-        state["paths"] = [str(p) for p in paths if p]
-        # Convert paths -> Documents (list[List[Document]] then flatten)
-        chunks_nested = self.doc_processor.batch_process_files(paths)
+        state["paths"] = self.file_handler.process_documents(files)
+        self.logger.info(f"Ingested: {state['paths']}")
+        chunks_nested = self.doc_processor.batch_process_files(state["paths"])
         docs: List[Document] = []
         for lst in chunks_nested:
             docs.extend(lst or [])
         state["documents"] = docs
-        logger.info(f"Ingested: {len(state['documents'])} chunks")
+        self.logger.info(f"Ingested: {len(state['documents'])} chunks")
+        # for doc in docs:
+        #     self.logger.info(f" - {doc.metadata.get('title', 'Untitled')}")
         return state
 
     def _build_retriever(self, state: AgentState) -> AgentState:
@@ -103,40 +109,52 @@ class WorkflowGraph:
     def _check_relevance(self, state: AgentState) -> AgentState:
         retriever = state.get("retriever")
         q = state["question"]
-        state["relevance"] = self.checker.check(q, retriever, k=3) if retriever else "NO_MATCH"
-        logger.info(f"Relevance: {state['relevance']}")
+        relevance = self.relevance_checker.check(q, retriever, k=3)
+        state["relevance"] = relevance["label"]  # fix: use label not just can_answer
+        self.logger.info(f"Relevance: {relevance}")
         return state
 
     def _answer_from_docs(self, state: AgentState) -> AgentState:
         # Minimal—fetch top docs and stitch a draft. You can replace with a SynthesisAgent.
         retriever = state["retriever"]
         top_docs = retriever.invoke(state["question"]) if retriever else []
-        ctx = "\n\n".join(d.page_content for d in top_docs[:5])
+        ctx = "\n\n".join(d.page_content for d in top_docs[:VECTOR_SEARCH_K])
         state["final_answer"] = f"Answer based on uploaded documents:\n\n{ctx}"
         return state
 
     def _web_search_agent(self, state: AgentState) -> AgentState:
         q = state["question"]
-        results = self.web_agent.search_papers(q)
-        state["web_results"] = results
+        result = self.web_agent.run(q)
+        # store the full output
+        state["web_results"] = result.get("conversation", [])
+        state["citations"] = result.get("citations", [])
+        # also pass along the agent's own final answer
+        state["final_answer"] = result.get("final_answer")
         return state
 
     def _synthesize_answer(self, state: AgentState) -> AgentState:
-        """
-        Combine doc evidence (if any) + web results into a single draft.
-        Replace with your SynthesisAgent if you have one.
-        """
         parts = []
         if state.get("relevance") == "CAN_ANSWER":
             parts.append(state.get("final_answer", ""))
 
         if state.get("web_results"):
-            top = state["web_results"][:5]
-            bullets = "\n".join(f"- {r.get('title','')} — {r.get('link','')}" for r in top)
-            parts.append(f"Supplementary web findings:\n{bullets}")
+            # summarize web agent’s results
+            parts.append("Web Agent Conversation:")
+            for step in state["web_results"]:
+                action = step.get("action")
+                if action == "search":
+                    parts.append(f"- Search: {step.get('query')}")
+                elif action == "respond":
+                    parts.append(f"- Initial Answer: {step['answer'].get('answer')}")
+                elif action == "revise":
+                    parts.append(f"- Revised Answer: {step['revised'].get('answer')}")
+            if state.get("citations"):
+                parts.append("Citations:\n" + "\n".join(f"- {c}" for c in state["citations"]))
 
         state["final_answer"] = "\n\n".join(p for p in parts if p) or "No answer found."
+
         return state
+
 
     # ---- public run ----
     def run(self, question: str, files: List[dict]) -> AgentState:
