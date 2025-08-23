@@ -1,4 +1,7 @@
-# -- Web search tool (Scholar via SerpAPI, else DDG) for WebSearchAgent
+# ============================================================
+# Derived Class 2: WebSearchAgent (Scholar/DDG tool + generic research prompts)
+# ============================================================
+
 from langchain_community.utilities.google_scholar import GoogleScholarAPIWrapper
 from langchain_community.tools.google_scholar.tool import GoogleScholarQueryRun
 from langchain_community.tools import DuckDuckGoSearchResults
@@ -6,24 +9,25 @@ from typing import List, Tuple
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import tool
-from agents.base_reflex_agent import BaseReflexAgent
+from agents.base_reflex_agent import BaseReflexAgent, RespondOutput, ReviseOutput
 import json
 import os
 
-# ============================================================
-# Derived Class 2: WebSearchAgent (Scholar/DDG tool + generic research prompts)
-# ============================================================
 
 def make_web_search_tool():
+    """
+    Wrap web search (Scholar via SerpAPI, else DuckDuckGo) as a tool.
+    Only used by the respond node.
+    """
     serp = os.getenv("SERPAPI_KEY", "")
     if serp:
         scholar = GoogleScholarQueryRun(
             api_wrapper=GoogleScholarAPIWrapper(serp_api_key=serp, top_k_results=8, hl="en")
         )
 
-        @tool("web_search", return_direct=False)
+        @tool("web_search", return_direct=True)
         def _search(query: str) -> str:
-            """Search the web (Google Scholar via SerpAPI) and return JSON of top results."""
+            """Search the web (Scholar via SerpAPI) and return top results as JSON."""
             raw = scholar.run(query)
             try:
                 data = json.loads(raw) if isinstance(raw, str) else raw
@@ -41,11 +45,12 @@ def make_web_search_tool():
 
         return _search
 
+    # DuckDuckGo fallback
     ddg = DuckDuckGoSearchResults()
 
-    @tool("web_search", return_direct=False)
+    @tool("web_search", return_direct=True)
     def _search(query: str) -> str:
-        """Search the web (DuckDuckGo fallback) and return JSON of top results."""
+        """Search the web (DuckDuckGo fallback) and return top results as JSON."""
         raw = ddg.run(query)
         try:
             data = json.loads(raw) if isinstance(raw, str) else raw
@@ -66,7 +71,9 @@ def make_web_search_tool():
 
 class WebSearchAgent(BaseReflexAgent):
     """
-    Uses a web search tool (Scholar via SerpAPI or DDG fallback) and neutral research prompts.
+    Reflex agent using a web search tool (Scholar via SerpAPI or DDG fallback).
+    Respond node fetches documents and synthesizes answers.
+    Revise node evaluates draft answer + feedback and decides end/reconsider with optional new queries.
     """
 
     def __init__(self, llm: BaseChatModel, **kwargs):
@@ -74,30 +81,32 @@ class WebSearchAgent(BaseReflexAgent):
         super().__init__(llm=llm, **kwargs)
 
     def _build_tools(self) -> List:
+        # Only respond node uses this tool
         return [self._web_tool]
 
     def _build_prompts(self) -> Tuple[ChatPromptTemplate, ChatPromptTemplate]:
+        # Responder prompt
         responder = ChatPromptTemplate.from_messages([
             ("system",
-            """You are a rigorous research-paper assistant.
-    1. {first_instruction}
-    2. When you call web_search, craft precise scholarly queries (boolean operators, synonyms, venue filters, recency if relevant).
-    3. Prefer peer-reviewed papers and credible venues (journals, conferences, preprints like arXiv/bioRxiv/medRxiv), authoritative standards, and high-quality surveys.
-    4. Synthesize cautiously: identify study type, population/setting, key methods, notable numbers, and limitations; contrast findings when sources disagree.
-    5. Keep a brief reflection of what’s missing vs. superfluous.
-    6. Propose 1–3 follow-up search queries.
-    Return by calling AnswerTool."""),
+             """You are a rigorous research-paper assistant.
+1. {first_instruction}
+2. When you call web_search, craft precise scholarly queries (boolean operators, synonyms, venue filters, recency if relevant).
+3. Prefer peer-reviewed papers and credible venues (journals, conferences, preprints like arXiv/bioRxiv/medRxiv), authoritative standards, and high-quality surveys.
+4. Synthesize cautiously: identify study type, population/setting, key methods, notable numbers, and limitations; contrast findings when sources disagree.
+5. Keep a brief reflection of what’s missing vs. superfluous.
+6. Propose 1–3 follow-up search queries.
+Return by calling RespondOutput."""),
             MessagesPlaceholder("history"),
         ])
 
+        # Reviser prompt
         reviser = ChatPromptTemplate.from_messages([
             ("system",
-            """Revise using any new search evidence; include explicit references (e.g., [Author, Year] – title or DOI/URL).
-    State consensus vs. open questions and limitations.
-    Decide action in ["reconsider","end"] and provide feedback if reconsider.
-    Return by calling ReviseTool."""),
+             """Revise using any new search evidence; include explicit references (e.g., [Author, Year] – title or DOI/URL).
+State consensus vs. open questions and limitations.
+Decide action in ["reconsider","end"] and provide feedback if reconsider.
+Optionally provide new queries for the next respond iteration.
+Return by calling ReviseOutput."""),
             MessagesPlaceholder("history"),
         ])
         return responder, reviser
-
-

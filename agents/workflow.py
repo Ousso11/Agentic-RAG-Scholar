@@ -143,32 +143,65 @@ class WorkflowGraph:
         return state
 
     def _answer_from_docs(self, state: AgentState) -> AgentState:
+        """
+        Uses DocSynthesisAgent (retriever-based) to produce answer.
+        Handles feedback, conversation, citations, and proposed follow-up queries.
+        """
         if not self.doc_synth_agent:
             state["final_answer"] = state.get("final_answer", "") or "No documents available for answering."
             state["answer_source"] = "none"
             return state
 
-        result = self.doc_synth_agent.run(state["question"])
+        # Determine query: use question or previous follow-up query if available
+        query = state.get("follow_up_query") or state["question"]
+        
+        result = self.doc_synth_agent.run(query)
         fa = (result.get("final_answer") or "").strip()
         if fa:
             state["final_answer"] = fa
             state["answer_source"] = "docs"
-        # only set citations if we actually have some
+
+        # Citations from reviser if available
         cits = result.get("citations") or []
         if cits:
             state["citations"] = cits
+
+        # Store full responder/reviser conversation
         state["doc_results"] = result.get("conversation", [])
+
+        # Capture proposed follow-up queries for next iteration
+        if result.get("conversation"):
+            last_round = result["conversation"][-1]
+            queries = last_round.get("queries") or []
+            if queries:
+                # store the first follow-up query; can extend to multiple
+                state["follow_up_query"] = queries[0]
+
         return state
 
-    # --- in _web_search_agent: only overwrite fields when the web agent produced something ---
-    def _web_search_agent(self, state: AgentState) -> AgentState:
-        q = state["question"]
-        result = self.web_agent.run(q)
 
+    # ---- updated _web_search_agent ----
+    def _web_search_agent(self, state: AgentState) -> AgentState:
+        """
+        Uses WebSearchAgent to produce answer from web (Scholar/DDG).
+        Handles feedback, conversation, citations, and proposed follow-up queries.
+        """
+        # Determine query: question or follow-up query
+        query = state.get("follow_up_query") or state["question"]
+
+        result = self.web_agent.run(query)
         convo = result.get("conversation") or []
+
         if convo:
             state["web_results"] = convo
 
+            # Capture proposed follow-up queries for next iteration
+            last_round = convo[-1]
+            queries = last_round.get("queries") or []
+            if queries:
+                state["follow_up_query"] = queries[0]
+
+        # Update final answer and citations only if agent produced something
         fa = (result.get("final_answer") or "").strip()
         if fa:
             state["final_answer"] = fa
