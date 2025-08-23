@@ -2,7 +2,8 @@ import gradio as gr
 from ollama_engine import ollama_setup
 from agents.workflow import WorkflowGraph
 from config import (
-    LLM_MODEL_NAME,
+    MODEL_OPTIONS,
+    DEFAULT_MODEL,
     EMBEDDING_MODEL_NAME,
     CHROMA_DB_PATH,
     VECTOR_SEARCH_K,
@@ -15,7 +16,7 @@ logger = Logger(__name__).get_logger()
 def setup_ollama_on_load():
     """Try to warm up Ollama models. UI notices are best-effort."""
     try:
-        ollama_setup(LLM_MODEL_NAME)
+        ollama_setup(DEFAULT_MODEL)
         ollama_setup(EMBEDDING_MODEL_NAME)
     except Exception as e:
         # Gradio notifications created outside a Blocks sometimes don't render.
@@ -27,7 +28,7 @@ def main():
     MAX_ROWS = 7
 
     wf = WorkflowGraph(
-        llm_model_name=LLM_MODEL_NAME,
+        llm_model_name=DEFAULT_MODEL,
         embedding_model_name=EMBEDDING_MODEL_NAME,
         chroma_dir=CHROMA_DB_PATH,
         vector_k=VECTOR_SEARCH_K,
@@ -45,11 +46,13 @@ def main():
                 placeholder="e.g. What are the latest papers on human evaluation in NLP?",
                 scale=4,
             )
-            with gr.Row():
-                add_btn = gr.Button("➕ Add Document", scale=1)
-                submit_btn = gr.Button("🔍 Search / Answer", variant="primary", scale=1)
-                
-
+            model_dd = gr.Dropdown(
+                MODEL_OPTIONS,
+                value=DEFAULT_MODEL,
+                label="Model",
+                scale=1,
+            )
+       
         # --- Documents section (rows hidden by default) ---
         row_containers = []  # the Row containers (so we can hide/show the whole row)
         row_dropdowns = []   # each row's Link/PDF choice
@@ -90,6 +93,10 @@ def main():
             row_textboxes.append(tb)
             row_filepickers.append(fp)
             row_delete_btns.append(del_btn)
+
+        with gr.Row():
+            add_btn = gr.Button("➕ Add Document", scale=1)
+            submit_btn = gr.Button("🔍 Search / Answer", variant="primary", scale=1)
 
         # Area to surface logs/answers
         output_message = gr.Textbox(label="Processing Log", interactive=False)
@@ -142,7 +149,7 @@ def main():
 
         # --- Handle submission ---
         def handle_submission(*all_inputs):
-            files, query = [], all_inputs[-1]
+            files, query, model_id = [], all_inputs[-2], all_inputs[-1]
             # Gather inputs row-wise: dropdowns, textboxes, filepickers
             for i in range(MAX_ROWS):
                 choice, text_val, file_val = all_inputs[i], all_inputs[MAX_ROWS + i], all_inputs[2 * MAX_ROWS + i]
@@ -153,6 +160,7 @@ def main():
                     files.append({"type": "pdf", "value": file_val})
 
             try:
+                wf.set_llm_model(model_id)
                 state = wf.run(question=query, files=files)
                 rel = state.get("relevance")
                 if rel == "CAN_ANSWER":
@@ -163,7 +171,7 @@ def main():
 
         submit_btn.click(
             fn=handle_submission,
-            inputs=row_dropdowns + row_textboxes + row_filepickers + [query_input],
+            inputs=row_dropdowns + row_textboxes + row_filepickers + [query_input, model_dd],
             outputs=output_message,
         )
 

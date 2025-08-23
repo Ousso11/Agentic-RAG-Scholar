@@ -20,15 +20,14 @@ def make_retriever_tool(retriever, name: str = "corpus_search", k: int = 5):
         for d in docs[:k]:
             src = d.metadata.get("source") or d.metadata.get("url") or ""
             parts.append(f"[{src}] {d.page_content}".strip())
+        print(f"Retrieved {len(parts)} snippets for query: {query}")
         return "\n\n".join(parts).strip() or "(no results)"
     return _search
-
 
 class DocSynthesisAgent(BaseReflexAgent):
     """
     Uses your local/vector retriever as a tool; prompts follow the Dr. Saladino (Carnivore MD) format.
     """
-
     def __init__(self, llm: BaseChatModel, retriever, **kwargs):
         self._retriever_tool = make_retriever_tool(retriever)
         super().__init__(llm=llm, **kwargs)
@@ -39,25 +38,35 @@ class DocSynthesisAgent(BaseReflexAgent):
     def _build_prompts(self) -> Tuple[ChatPromptTemplate, ChatPromptTemplate]:
         responder = ChatPromptTemplate.from_messages([
             ("system",
-            """You are a rigorous research-paper assistant using a local corpus.
+            """You are a rigorous research assistant. 
+    You MUST return your output ONLY by calling the tool AnswerTool, nothing else. 
+    Follow the schema strictly:
+
+    Guidelines:
     1. {first_instruction}
-    2. Use the corpus_search tool to retrieve the most relevant passages; ground claims in those snippets.
-    3. Synthesize cautiously: identify study type, methods, scope, and limitations; avoid over-generalizing beyond the retrieved evidence.
-    4. If evidence is insufficient or uncertain, say so and list what’s missing.
-    5. Provide 1–3 suggested web follow-up queries that would likely improve coverage.
-    Return by calling AnswerTool."""),
+    2. Use corpus_search to retrieve relevant passages and ground claims.
+    3. Synthesize cautiously: identify study type, methods, scope, limitations.
+    4. If evidence is missing/uncertain, state so under 'reflection.missing'.
+    5. Suggest 1–3 web queries under 'search_queries'.
+    """),
             MessagesPlaceholder("history"),
-            ("system", "Answer concisely first, then expand with evidence and a short reflection.")
         ])
 
         reviser = ChatPromptTemplate.from_messages([
             ("system",
-            """Revise the prior answer using any new tool context (retrieved snippets).
-    Add compact, explicit references from the corpus (e.g., use each chunk’s source/URL/identifier if available).
-    Clarify uncertainties and limitations.
-    Decide action in ["reconsider","end"]; provide feedback if reconsider.
-    Return by calling ReviseTool."""),
+            """You are a reviser. 
+    You MUST return your output ONLY by calling the tool ReviseTool, nothing else. 
+    Follow the schema strictly: 
+
+    Guidelines:
+    - Use any new corpus_search snippets if available.
+    - Add compact explicit references (URLs or sources).
+    - Clarify uncertainties and limitations.
+    - If more work is needed, set action="reconsider" and explain why in "feedback".
+    - Otherwise, set action="end".
+    """),
             MessagesPlaceholder("history"),
         ])
         return responder, reviser
+
 

@@ -62,10 +62,16 @@ class WorkflowGraph:
         self.relevance_checker = RelevanceChecker(model_name=llm_model_name, logger=self.logger)
 
         # Agents (DocSynthesisAgent is created after retriever exists)
-        self.doc_synth_agent: Optional[DocSynthesisAgent] = None
+        self.doc_synth_agent = DocSynthesisAgent(llm=self.llm, retriever=self.retriever_builder, logger=self.logger)
         self.web_agent = WebSearchAgent(llm=self.llm, logger=self.logger)
 
         self.build_workflow()
+
+    def set_llm_model(self, model_name: str):
+        self.llm = ChatOllama(model=model_name, temperature=0)
+        self.doc_synth_agent.llm = self.llm
+        self.web_agent.llm = self.llm
+        self.logger.info(f"LLM model set to {model_name}")
 
     def build_workflow(self):
         graph = StateGraph(AgentState)
@@ -176,43 +182,64 @@ class WorkflowGraph:
 
     # --- in _synthesize_answer: prefer existing answer, add trace if present, never fall back to empty ---
     def _synthesize_answer(self, state: AgentState) -> AgentState:
-        parts: List[str] = []
-        src = state.get("answer_source", "")
-
-        # If docs were sufficient, keep that body
-        if state.get("relevance") == "CAN_ANSWER" and src in ("docs", "") and state.get("final_answer"):
-            parts.append(state["final_answer"])
-            if state.get("citations"):
-                parts.append("Citations:\n" + "\n".join(f"- {c}" for c in state["citations"]))
-
-        # If we went to the web (PARTIAL/NO_MATCH), include a compact trace + final
-        if state.get("web_results"):
-            parts.append("Web Agent Summary:")
-            for step in state["web_results"]:
-                action = step.get("action")
+        """
+        Produce a single formatted message:
+        - Final Answer (top)
+        - Citations (if any)
+        - Transcript with rounds (Responder/Reviser) for docs and/or web paths.
+        """
+        def build_rounds(conversation: List[Dict]) -> List[str]:
+            lines: List[str] = []
+            if not conversation:
+                return lines
+            round_num = 0
+            for step in conversation:
+                action = (step.get("action") or "").lower()
                 if action == "respond":
-                    queries = step.get("queries") or []
-                    if queries:
-                        parts.append(f"- Proposed follow-up queries: {', '.join(queries)}")
+                    round_num += 1
+                    q = step.get("queries") or []
+                    lines.append(f"Round {round_num} — Responder")
+                    if q:
+                        lines.append(f"  • Proposed follow-up queries: {', '.join(q)}")
                 elif action == "revise":
+                    # same round number (reviser follows the responder of that round)
                     decision = step.get("decision", "end")
-                    parts.append(f"- Revision decision: {decision}")
-            if state.get("final_answer"):
-                parts.append("\nWeb Agent Final Answer:\n" + state["final_answer"])
-            if state.get("citations"):
-                parts.append("Citations:\n" + "\n".join(f"- {c}" for c in state["citations"]))
+                    refs = step.get("refs") or []
+                    lines.append(f"  ↳ Reviser (decision: {decision})")
+                    if refs:
+                        lines.append(f"    • References: {', '.join(refs)}")
+            return lines
 
-        # Finalize with a safe fallback:
-        synthesized = "\n\n".join(p for p in parts if p).strip()
-        if synthesized:
-            state["final_answer"] = synthesized
-            return state
+        parts: List[str] = []
 
-        # If we got here, keep any non-empty prior answer rather than dropping to "No answer found."
-        prior = (state.get("final_answer") or "").strip()
-        state["final_answer"] = prior or "No answer found."
+        # ---- 1) Final Answer ----
+        final_answer = (state.get("final_answer") or "").strip() or "No answer found."
+        parts.append(final_answer)
+
+        # ---- 2) Citations (if any) ----
+        cits = state.get("citations") or []
+        if cits:
+            parts.append("Citations:\n" + "\n".join(f"- {c}" for c in cits))
+
+        # ---- 3) Transcript (if any) ----
+        doc_rounds = build_rounds(state.get("doc_results") or [])
+        web_rounds = build_rounds(state.get("web_results") or [])
+
+        transcript_lines: List[str] = []
+        if doc_rounds:
+            transcript_lines.append("Transcript — Docs Path")
+            transcript_lines.extend(doc_rounds)
+        if web_rounds:
+            transcript_lines.append("Transcript — Web Path")
+            transcript_lines.extend(web_rounds)
+
+        if transcript_lines:
+            parts.append("\n".join(transcript_lines))
+
+        # Join everything into the final formatted answer
+        state["final_answer"] = "\n\n".join(p for p in parts if p).strip()
         return state
-    
+
     # ---- public run ----
     def run(self, question: str, files: List[dict]) -> AgentState:
         """
