@@ -1,5 +1,5 @@
 # ============================================================
-# Derived Class 2: WebSearchAgent (Scholar/DDG tool + generic research prompts)
+# Derived Class 2: WebSearchAgent (Scholar/DDG tool + reflex agent)
 # ============================================================
 
 from langchain_community.utilities.google_scholar import GoogleScholarAPIWrapper
@@ -9,9 +9,9 @@ from typing import List, Tuple
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import tool
+from langchain_core.output_parsers import JsonOutputParser
 from agents.base_reflex_agent import BaseReflexAgent, RespondOutput, ReviseOutput
-import json
-import os
+import json, os
 
 
 def make_web_search_tool():
@@ -70,43 +70,50 @@ def make_web_search_tool():
 
 
 class WebSearchAgent(BaseReflexAgent):
-    """
-    Reflex agent using a web search tool (Scholar via SerpAPI or DDG fallback).
-    Respond node fetches documents and synthesizes answers.
-    Revise node evaluates draft answer + feedback and decides end/reconsider with optional new queries.
-    """
-
     def __init__(self, llm: BaseChatModel, **kwargs):
         self._web_tool = make_web_search_tool()
         super().__init__(llm=llm, **kwargs)
 
     def _build_tools(self) -> List:
-        # Only respond node uses this tool
         return [self._web_tool]
 
     def _build_prompts(self) -> Tuple[ChatPromptTemplate, ChatPromptTemplate]:
-        # Responder prompt
-        responder = ChatPromptTemplate.from_messages([
+        responder_prompt = ChatPromptTemplate.from_messages([
             ("system",
-             """You are a rigorous research-paper assistant.
-1. {first_instruction}
-2. When you call web_search, craft precise scholarly queries (boolean operators, synonyms, venue filters, recency if relevant).
-3. Prefer peer-reviewed papers and credible venues (journals, conferences, preprints like arXiv/bioRxiv/medRxiv), authoritative standards, and high-quality surveys.
-4. Synthesize cautiously: identify study type, population/setting, key methods, notable numbers, and limitations; contrast findings when sources disagree.
-5. Keep a brief reflection of what’s missing vs. superfluous.
-6. Propose 1–3 follow-up search queries.
-Return by calling RespondOutput."""),
-            MessagesPlaceholder("history"),
-        ])
+             """You are a rigorous research assistant.
 
-        # Reviser prompt
-        reviser = ChatPromptTemplate.from_messages([
-            ("system",
-             """Revise using any new search evidence; include explicit references (e.g., [Author, Year] – title or DOI/URL).
-State consensus vs. open questions and limitations.
-Decide action in ["reconsider","end"] and provide feedback if reconsider.
-Optionally provide new queries for the next respond iteration.
-Return by calling ReviseOutput."""),
+Return ONLY valid JSON strictly matching the RespondOutput schema:
+{format_instructions}
+
+Guidelines:
+1. Always start with a concise direct answer, then expand with synthesis of the context.
+2. If you used web_search, identify the key findings (methods, study type, population, numbers, limitations).
+3. Mention disagreements if sources diverge.
+4. Provide self-feedback (what's missing, redundant, or uncertain).
+5. Propose 1–3 improved search queries for the next round.
+"""),
             MessagesPlaceholder("history"),
         ])
-        return responder, reviser
+        responder_parser = JsonOutputParser(pydantic_object=RespondOutput)
+        responder_prompt = responder_prompt.partial(format_instructions=responder_parser.get_format_instructions())
+
+        reviser_prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             """You are a critical reviser.
+
+Return ONLY valid JSON strictly matching the ReviseOutput schema:
+{format_instructions}
+
+Guidelines:
+1. Review the draft answer and self-feedback.
+2. If additional evidence is needed, suggest 1–3 new queries.
+3. Return a fully revised answer (not just feedback).
+4. Decide action: "reconsider" (if more search is needed) or "end".
+5. Provide constructive feedback for improvement.
+"""),
+            MessagesPlaceholder("history"),
+        ])
+        reviser_parser = JsonOutputParser(pydantic_object=ReviseOutput)
+        reviser_prompt = reviser_prompt.partial(format_instructions=reviser_parser.get_format_instructions())
+
+        return responder_prompt, reviser_prompt

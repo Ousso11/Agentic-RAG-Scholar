@@ -1,12 +1,12 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Literal, TypedDict, Tuple
+from typing import List, Optional, Literal, Tuple
 
-from pydantic import BaseModel, Field
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, Field, ValidationError
+from langgraph.graph import StateGraph, END, MessagesState
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, AIMessage
 
 
 # ------------------ Structured Outputs ------------------
@@ -20,28 +20,38 @@ class ReviseOutput(BaseModel):
     answer: str
     feedback: str
     action: Literal["reconsider", "end"]
-    new_queries: List[str] = Field(default_factory=list)
+    additional_queries: List[str] = Field(default_factory=list)
 
 
-# ------------------ Abstract Reflex Agent ------------------
+# ------------------ BaseReflexAgent ------------------
 class BaseReflexAgent(ABC):
-    class State(TypedDict, total=False):
-        question: str
+    """
+    Reflex agent using LangGraph's MessagesState (built-in chat memory).
+    Loop: respond -> revise -> (reconsider ? respond : end)
+    """
+
+    class State(MessagesState):  # inherits `messages: List[BaseMessage]`
         iteration: int
-        conversation: List[Dict]
-        draft: RespondOutput
-        revised: ReviseOutput
-        feedback: str
+        draft: Optional[RespondOutput]
+        revised: Optional[ReviseOutput]
+        feedback: Optional[str]
         queries: List[str]
+        trace: List[dict]
 
     def __init__(self, llm: BaseChatModel, max_iters: int = 3, logger: Optional[logging.Logger] = None):
         self.llm = llm
         self.max_iters = max_iters
         self.logger = logger or logging.getLogger(self.__class__.__name__)
 
+        # subclass-provided
         self.responder_prompt, self.revision_prompt = self._build_prompts()
-        self.external_tools = self._build_tools()  # e.g., retrievers/search
+        self.external_tools = self._build_tools()
 
+        # Chains
+        self.respond_chain = self.responder_prompt | self.llm.with_structured_output(RespondOutput)
+        self.revise_chain = self.revision_prompt | self.llm.with_structured_output(ReviseOutput)
+
+        # Graph wiring
         g = StateGraph(self.State)
         g.add_node("respond", self.node_respond)
         g.add_node("revise", self.node_revise)
@@ -59,70 +69,117 @@ class BaseReflexAgent(ABC):
     def _build_tools(self) -> List:
         ...
 
-    # ----- nodes -----
+    # ----- RESPOND -----
     def node_respond(self, state: State) -> State:
-        """
-        Respond node: fetch documents using queries, call LLM once, return answer + feedback.
-        """
-        question = state["question"]
+        question = None
+        for msg in state["messages"]:
+            if isinstance(msg, HumanMessage):
+                question = msg.content
+        if not question:
+            raise ValueError("No HumanMessage (question) found in history")
+        self.logger.info(f"Responding to question: {question}")
         queries = state.get("queries") or [question]
-        feedback = state.get("feedback") or ""
+        prev_feedback = state.get("feedback") or ""
 
-        # ---------------- Fetch documents ----------------
-        fetched_docs = []
+        # 1) Fetch documents
+        fetched_blobs: List[str] = []
         for q in queries:
             for tool in self.external_tools:
-                result = tool.invoke({"query": q})
-                fetched_docs.append(result)
+                try:
+                    out = tool.invoke({"query": q})
+                except Exception as e:
+                    self.logger.exception(f"Tool {getattr(tool, 'name', tool)} failed for query='{q}': {e}")
+                    out = f"(tool-error for query='{q}': {e})"
+                fetched_blobs.append(str(out) if out is not None else "")
+        context = "\n\n---\n\n".join(x for x in fetched_blobs if x).strip()
 
-        # ---------------- Call LLM ----------------
-        context_msg = "\n".join(str(d) for d in fetched_docs)
-        prompt_msg = f"Question: {question}\nContext:\n{context_msg}\nFeedback:\n{feedback}"
-        msgs = self.responder_prompt.format_messages(
-            first_instruction="Answer concisely then expand.",
-            history=[HumanMessage(content=prompt_msg)]
-        )
-        resp = self.llm.invoke(msgs)
+        # 2) Call LLM
+        try:
+            draft: RespondOutput = self.respond_chain.invoke({
+                "first_instruction": "Answer concisely first, then expand if needed.",
+                "question": question,
+                "context": context or "(no external context)",
+                "feedback": prev_feedback or "(none)",
+                "queries": ", ".join(queries),
+                "history": state["messages"],  # works since MessagesState ensures BaseMessage[]
+            })
+        except (ValidationError, Exception) as e:
+            self.logger.error(f"Respond chain failed: {e}")
+            draft = RespondOutput(answer="", feedback=str(e), search_queries=list(queries))
 
-        # Parse structured RespondOutput
-        draft = RespondOutput(
-            answer=getattr(resp, "answer", getattr(resp, "content", "")),
-            feedback=getattr(resp, "feedback", ""),
-            search_queries=queries
-        )
+        self.logger.info(f"Draft answer generated: {draft.answer}, Feedback: {draft.feedback}, Queries: {queries}")
 
-        conv = state.get("conversation", [])
-        conv.append({"action": "respond", "queries": draft.search_queries})
-        self.logger.debug(f"Respond output: {draft.answer[:200]} | feedback: {draft.feedback}")
-        return {**state, "draft": draft, "conversation": conv}
+        # record trace
+        trace_entry = {
+            "iteration": state.get("iteration", 0) + 1,
+            "action": "respond",
+            "content": draft.answer,
+            "queries": draft.search_queries or [],
+            "feedback": draft.feedback,
+        }
 
+        return {
+            **state,
+            "draft": draft,
+            "messages": state["messages"] + [AIMessage(content=draft.answer)],
+            "trace": (state.get("trace") or []) + [trace_entry],
+        }
+
+    # ----- REVISE -----
     def node_revise(self, state: State) -> State:
-        """
-        Revise node: only sees draft answer + feedback, decides action and optional new queries.
-        """
         draft: RespondOutput = state["draft"]
-        feedback_msg = f"Draft answer:\n{draft.answer}\nSelf-feedback:\n{draft.feedback}"
-        msgs = self.revision_prompt.format_messages(
-            first_instruction="Critique, revise, and decide: reconsider or end.",
-            history=[HumanMessage(content=feedback_msg)]
-        )
-        resp = self.llm.invoke(msgs)
+        question = None
+        for msg in state["messages"]:
+            if isinstance(msg, HumanMessage):
+                question = msg.content
+        self.logger.info(f"Revising draft answer for question: {question}")
+        prior_queries = (draft.search_queries or state.get("queries") or [question])
 
-        # Parse structured ReviseOutput
-        revised = ReviseOutput(
-            answer=getattr(resp, "answer", draft.answer),
-            feedback=getattr(resp, "feedback", ""),
-            action=getattr(resp, "action", "end"),
-            new_queries=getattr(resp, "new_queries", [])
-        )
+        try:
+            revised: ReviseOutput = self.revise_chain.invoke({
+                "first_instruction": "Critique, refine, then decide reconsider/end.",
+                "question": question,
+                "draft_answer": draft.answer,
+                "draft_feedback": draft.feedback or "(none)",
+                "prior_queries": ", ".join(prior_queries),
+                "history": state["messages"],
+            })
+        except (ValidationError, Exception) as e:
+            self.logger.error(f"Revise chain failed: {e}")
+            revised = ReviseOutput(
+                answer=draft.answer,
+                feedback=str(e),
+                action="end",
+                additional_queries=[],
+            )
 
         i = state.get("iteration", 0) + 1
-        conv = state.get("conversation", [])
-        conv.append({"action": "revise", "decision": revised.action, "new_queries": revised.new_queries})
-        self.logger.debug(f"Revise output: {revised.answer[:200]} | feedback: {revised.feedback} | action: {revised.action}")
-        return {**state, "revised": revised, "iteration": i, "conversation": conv, "feedback": revised.feedback, "queries": revised.new_queries}
+        next_queries = list(revised.additional_queries) if revised.action == "reconsider" else []
 
-    # ----- controller -----
+        self.logger.info(f"Revision iteration {i} complete. Action: {revised.action}, Next queries: {next_queries}")
+        self.logger.debug(f"Revised answer: {revised.answer}, Feedback: {revised.feedback}")
+
+        # record trace
+        trace_entry = {
+            "iteration": i,
+            "action": "revise",
+            "content": revised.answer,
+            "decision": revised.action,
+            "feedback": revised.feedback,
+            "queries": revised.additional_queries or [],
+            "refs": getattr(revised, "citations", []),
+        }
+
+        return {
+            **state,
+            "revised": revised,
+            "iteration": i,
+            "feedback": revised.feedback,
+            "queries": next_queries if next_queries else state.get("queries", []),
+            "messages": state["messages"] + [AIMessage(content=f"[Revise decision: {revised.action}] {revised.answer}")],
+            "trace": (state.get("trace") or []) + [trace_entry],
+        }
+
     def _should_continue(self, state: State) -> Literal["respond", "end"]:
         if state.get("iteration", 0) >= self.max_iters:
             return "end"
@@ -132,19 +189,34 @@ class BaseReflexAgent(ABC):
         return "end"
 
     # ----- API -----
-    def run(self, question: str) -> Dict:
-        init: BaseReflexAgent.State = {
-            "question": question,
-            "iteration": 0,
-            "conversation": [],
-            "queries": [question],
-            "feedback": ""
-        }
+    def run(self, question: str):
+        init = self.State(
+            messages=[HumanMessage(content=question)],
+            iteration=0,
+            queries=[question],
+            feedback="",
+            trace=[],
+        )
         final = self.graph.invoke(init)
-        final_answer = (final.get("revised") and final["revised"].answer) or (final.get("draft") and final["draft"].answer) or ""
+
+        # Collect final answer
+        final_answer = (
+            (final.get("revised") and final["revised"].answer)
+            or (final.get("draft") and final["draft"].answer)
+            or ""
+        )
+
+        conversation = final.get("trace", [])
+        citations: List[str] = []
+        for step in conversation:
+            if step.get("refs"):
+                citations.extend(step["refs"])
+
         return {
             "question": question,
             "final_answer": final_answer,
-            "conversation": final.get("conversation", []),
             "iterations": final.get("iteration", 0),
+            "messages": final.get("messages", []),     # raw AI/Human messages
+            "conversation": conversation,              # structured trace (all rounds!)
+            "citations": citations,                    # all refs
         }

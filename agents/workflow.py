@@ -14,7 +14,10 @@ from agents.relevance_checker import RelevanceChecker
 from agents.web_search_agent import WebSearchAgent         # <- derived class from BaseReflexAgent (web search tool)
 from config import WEB_SEARCH_AGENT_K, VECTOR_SEARCH_K  # (kept import for config compatibility)
 
-
+OLLAMA_PARAMS = {
+    "temperature": 0,
+    "num_ctx": 131072,        # use what your model supports (e.g., 128k for llama3.1)
+}
 # -------- State --------
 class AgentState(TypedDict, total=False):
     question: str
@@ -49,7 +52,7 @@ class WorkflowGraph:
         self.doc_processor = DocumentProcessor(logger=self.logger)
 
         # Single LLM instance shared by all agents (must support tool-calling)
-        self.llm = ChatOllama(model=llm_model_name, temperature=0)  # e.g., "llama3.1" or another tool-capable model
+        self.llm = ChatOllama(model=llm_model_name, **OLLAMA_PARAMS)  # e.g., "llama3.1" or another tool-capable model
 
         # Builders / checkers
         self.retriever_builder = RetrieverBuilder(
@@ -68,9 +71,12 @@ class WorkflowGraph:
         self.build_workflow()
 
     def set_llm_model(self, model_name: str):
-        self.llm = ChatOllama(model=model_name, temperature=0)
-        self.doc_synth_agent.llm = self.llm
-        self.web_agent.llm = self.llm
+        self.logger.info(f"Switching LLM model to {model_name}...")
+        self.llm = ChatOllama(model=model_name, **OLLAMA_PARAMS)
+        if self.doc_synth_agent:
+            self.doc_synth_agent.llm = self.llm
+        if self.web_agent:
+            self.web_agent.llm = self.llm
         self.logger.info(f"LLM model set to {model_name}")
 
     def build_workflow(self):
@@ -152,7 +158,7 @@ class WorkflowGraph:
             state["answer_source"] = "none"
             return state
 
-        # Determine query: use question or previous follow-up query if available
+        # Determine query
         query = state.get("follow_up_query") or state["question"]
         
         result = self.doc_synth_agent.run(query)
@@ -161,20 +167,18 @@ class WorkflowGraph:
             state["final_answer"] = fa
             state["answer_source"] = "docs"
 
-        # Citations from reviser if available
-        cits = result.get("citations") or []
-        if cits:
-            state["citations"] = cits
+        # Citations
+        if result.get("citations"):
+            state["citations"] = result["citations"]
 
-        # Store full responder/reviser conversation
+        # Full conversation trace
         state["doc_results"] = result.get("conversation", [])
 
-        # Capture proposed follow-up queries for next iteration
+        # Follow-up query
         if result.get("conversation"):
             last_round = result["conversation"][-1]
             queries = last_round.get("queries") or []
             if queries:
-                # store the first follow-up query; can extend to multiple
                 state["follow_up_query"] = queries[0]
 
         return state
@@ -186,93 +190,100 @@ class WorkflowGraph:
         Uses WebSearchAgent to produce answer from web (Scholar/DDG).
         Handles feedback, conversation, citations, and proposed follow-up queries.
         """
-        # Determine query: question or follow-up query
         query = state.get("follow_up_query") or state["question"]
-
         result = self.web_agent.run(query)
-        convo = result.get("conversation") or []
 
-        if convo:
-            state["web_results"] = convo
+        # Conversation trace
+        if result.get("conversation"):
+            state["web_results"] = result["conversation"]
 
-            # Capture proposed follow-up queries for next iteration
-            last_round = convo[-1]
+            # Next follow-up query
+            last_round = result["conversation"][-1]
             queries = last_round.get("queries") or []
             if queries:
                 state["follow_up_query"] = queries[0]
 
-        # Update final answer and citations only if agent produced something
+        # Final answer
         fa = (result.get("final_answer") or "").strip()
         if fa:
             state["final_answer"] = fa
             state["answer_source"] = "web"
 
-        cits = result.get("citations") or []
-        if cits:
-            state["citations"] = cits
+        # Citations
+        if result.get("citations"):
+            state["citations"] = result["citations"]
 
         return state
+
 
     # --- in _synthesize_answer: prefer existing answer, add trace if present, never fall back to empty ---
     def _synthesize_answer(self, state: AgentState) -> AgentState:
         """
-        Produce a single formatted message:
-        - Final Answer (top)
-        - Citations (if any)
-        - Transcript with rounds (Responder/Reviser) for docs and/or web paths.
+        Produce a formatted result:
+        1. Final Answer
+        2. Citations
+        3. Conversation Transcript (numbered & structured)
         """
-        def build_rounds(conversation: List[Dict]) -> List[str]:
-            lines: List[str] = []
+
+        def format_rounds(conversation: List[Dict], path_label: str) -> List[str]:
+            """
+            Turn conversation steps into numbered, clearly formatted transcript.
+            """
             if not conversation:
-                return lines
+                return []
+
+            lines: List[str] = [f"{path_label} Transcript:"]
             round_num = 0
+
             for step in conversation:
                 action = (step.get("action") or "").lower()
+
                 if action == "respond":
                     round_num += 1
-                    q = step.get("queries") or []
-                    lines.append(f"Round {round_num} — Responder")
-                    if q:
-                        lines.append(f"  • Proposed follow-up queries: {', '.join(q)}")
+                    lines.append(f"\nRound {round_num} — Responder")
+                    if step.get("content"):
+                        lines.append(f"  Draft: {step['content']}")
+                    if step.get("queries"):
+                        lines.append("  Proposed follow-up queries:")
+                        for i, q in enumerate(step["queries"], start=1):
+                            lines.append(f"    {i}. {q}")
+
                 elif action == "revise":
-                    # same round number (reviser follows the responder of that round)
                     decision = step.get("decision", "end")
-                    refs = step.get("refs") or []
                     lines.append(f"  ↳ Reviser (decision: {decision})")
-                    if refs:
-                        lines.append(f"    • References: {', '.join(refs)}")
+                    if step.get("feedback"):
+                        lines.append(f"    Feedback: {step['feedback']}")
+                    if step.get("refs"):
+                        lines.append("    References:")
+                        for r in step["refs"]:
+                            lines.append(f"      - {r}")
+
             return lines
 
+        # -------- Assemble Final Output --------
         parts: List[str] = []
 
-        # ---- 1) Final Answer ----
+        # 1) Final Answer
         final_answer = (state.get("final_answer") or "").strip() or "No answer found."
-        parts.append(final_answer)
+        parts.append(f"Final Answer:\n{final_answer}")
 
-        # ---- 2) Citations (if any) ----
+        # 2) Citations
         cits = state.get("citations") or []
         if cits:
             parts.append("Citations:\n" + "\n".join(f"- {c}" for c in cits))
 
-        # ---- 3) Transcript (if any) ----
-        doc_rounds = build_rounds(state.get("doc_results") or [])
-        web_rounds = build_rounds(state.get("web_results") or [])
-
+        # 3) Conversation Transcript
         transcript_lines: List[str] = []
-        if doc_rounds:
-            transcript_lines.append("Transcript — Docs Path")
-            transcript_lines.extend(doc_rounds)
-        if web_rounds:
-            transcript_lines.append("Transcript — Web Path")
-            transcript_lines.extend(web_rounds)
+        transcript_lines.extend(format_rounds(state.get("doc_results") or [], "Docs Path"))
+        transcript_lines.extend(format_rounds(state.get("web_results") or [], "Web Path"))
 
         if transcript_lines:
             parts.append("\n".join(transcript_lines))
 
-        # Join everything into the final formatted answer
-        state["final_answer"] = "\n\n".join(p for p in parts if p).strip()
+        # Final combined text
+        state["final_answer"] = "\n\n".join(parts).strip()
         return state
-
+    
     # ---- public run ----
     def run(self, question: str, files: List[dict]) -> AgentState:
         """

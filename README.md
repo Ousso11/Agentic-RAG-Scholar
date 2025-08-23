@@ -1,42 +1,129 @@
-# Agentic-RAG-Scholar
-An Agentic RAG system for intelligent research paper analysis. This application uses an agentic approach to retrieve, synthesize, and cite information from academic papers with natural language queries.
-# Agentic RAG for Research Papers
+# Agentic-RAG Scholar
 
-### Project Overview
-This application is a sophisticated, multi-agent system that goes beyond traditional keyword search to provide comprehensive, cited answers to natural language questions about research papers. Powered by a **Reflexion Agent** and a dynamic routing mechanism, it intelligently processes documents and synthesizes information to deliver high-quality, transparent insights.
+## Project Overview
 
-***
+**Agentic-RAG Scholar** is an advanced question-answering system built on **Retrieval-Augmented Generation (RAG)** and agent orchestration. It enables users to query scientific documents (PDFs, web links) and augment responses with web searches, producing accurate, evidence-backed, and traceable answers. The user interface is powered by **Gradio**.
 
-### Agentic Workflow
+The project uses **two main agents**:
 
-1.  **Document Processing Agent:**
-    * **Role:** The system's **ingestion specialist**.
-    * **Process:** Takes a PDF/URL, uses **Docling** for structured parsing, and splits the content into meaningful chunks. It then creates a new, dedicated collection in **ChromaDB** for the document's content and a high-level metadata entry in a central **Collection Hub**. 
+1. **Retriever-based Reflexive Agent** – Iterates over documents using a hybrid retriever (BM25 + ChromaDB embeddings) to generate and refine answers.
+2. **Web Search Reflexive Agent** – Uses web search tools (Google Scholar via SerpAPI or DuckDuckGo) to provide answers when documents are insufficient.
 
-2.  **Relevance Retriever Agent:**
-    * **Role:** The **preliminary search agent**.
-    * **Process:** This is the first agent to run on a query. It performs a fast, high-level search by querying the central **Collection Hub** using a combination of vector search and keyword matching. It assesses whether the current corpus contains relevant documents for the user's query and identifies the specific collections to search.
+Both agents are reflexive, meaning they self-critique and iteratively refine their responses for accuracy.
 
-3.  **Relevance Checking Agent:**
-    * **Role:** The intelligent **gatekeeper**.
-    * **Process:** Based on the results from the **Relevance Retriever Agent**, this agent decides whether to proceed with the core RAG process. If the results are promising, it activates the **Core Retriever Agent**. If not, it activates the **Web Search Agent**.
+Key libraries include **LangChain**, **LangGraph**, **ChromaDB**, and **Gradio**.
 
-4.  **Web Search Agent:**
-    * **Role:** The **external resource finder**.
-    * **Process:** This agent is a fallback, activated only when the **Relevance Checking Agent** determines no suitable documents exist in the local database. Its purpose is to perform a targeted web search and provide the user with links to relevant external papers.
+---
 
-5.  **Core Retriever Agent:**
-    * **Role:** The **deep search agent**.
-    * **Process:** This agent performs the core retrieval task. It receives instructions from the **Reflexion Synthesis Agent** and performs a deep, targeted search within the specific document collections identified earlier to retrieve the most relevant chunks.
+## Key Features
 
-6.  **Reflexion Synthesis Agent:**
-    * **Role:** The **iterative reasoner**.
-    * **Process:** Using **LangGraph** to manage its state and cycles, this is the core of the system. It enters a ReAct-based loop to refine its answer.
-        * **Reasoning:** The agent analyzes the user's query and identifies gaps in the retrieved context.
-        * **Acting:** It calls the **Core Retriever Agent** as a tool to perform a targeted search.
-        * **Observing:** It critically evaluates the new information.
-        * **Reflecting:** If the answer isn't yet satisfactory, it adjusts its plan and initiates another reasoning/acting cycle.
+* Upload documents (PDFs or web links)
+* Hybrid search combining vector search and keyword search (Retriever Agent)
+* Web search fallback when documents are insufficient (Web Search Agent)
+* Reflexive answer generation with iterative self-critique
+* Evidence-backed answers with citations
+* Simple and intuitive web interface (Gradio)
+* Powered by **LangChain**, **LangGraph**, and **ChromaDB** for retrieval and orchestration
 
-7.  **Final Response:**
-    * **Role:** Provides a complete, transparent answer.
-    * **Process:** The Reflexion agent, once satisfied, synthesizes the final answer, including direct citations to the original document chunks and a list of all sources and links used.
+---
+
+## Architecture and Workflow
+
+### 1. Main Agents
+
+#### a) Retriever-based Reflexive Agent
+
+Uses a **hybrid retriever** (ChromaDB embeddings + BM25) to find relevant document chunks and generate answers iteratively with self-reflection.
+
+#### b) Web Search Reflexive Agent
+
+Uses **Google Scholar** or **DuckDuckGo** tools wrapped as a reflexive agent to answer questions when documents are not available.
+
+### 2. Reflexive Synthesis
+
+Each agent follows a reflexive process:
+
+1. Generate an initial answer.
+2. Critique and refine the response.
+3. Propose follow-up queries if needed.
+4. Stop when answer is satisfactory or maximum iterations reached.
+
+### 3. Orchestration Workflow
+
+The workflow (`agents/workflow.py`) works as follows:
+
+1. Receive the user question.
+2. Search uploaded documents with the Retriever Agent.
+3. If needed, perform a web search with the Web Search Agent.
+4. Use reflexive synthesis to generate the final answer.
+5. Return the answer with citations and conversation trace.
+
+---
+
+## Installation
+
+### Prerequisites
+
+* Python 3.10+
+* [Ollama](https://ollama.com/) (for local LLMs)
+* [Homebrew](https://brew.sh/) (for macOS)
+* Python libraries: **langchain**, **langgraph**, **chromadb**, **gradio**, and others listed in `requirements.txt`
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/Ousso11/Agentic-RAG-Scholar.git
+cd Agentic-RAG-Scholar
+```
+
+### 2. Setup the environment
+
+```bash
+./setup.sh
+conda activate agentic-rag-env
+```
+
+---
+
+## Running the Application
+
+```bash
+python main.py
+# or
+python3 main.py
+```
+
+The Gradio interface will be available at [http://localhost:7860](http://localhost:7860).
+
+---
+
+## Usage
+
+1. Enter your question in the main input field.
+2. Add documents (PDFs or web links).
+3. Start the search.
+4. Review the answer, citations, and conversation trace.
+
+---
+
+## Folder Structure
+
+* `agents/` : contains all agents (retriever, web search, synthesis, etc.)
+* `document_processing/` : document extraction and management
+* `chroma_db/` : local vector database
+* `main.py` : Gradio app entry point
+* `ollama_engine.py` : Ollama integration and model management
+* `config.py` : configuration for models and parameters
+* `logger.py` : colored logger for debugging
+
+---
+
+## Customization
+
+Change the models used in `config.py` (`MODEL_OPTIONS`, `DEFAULT_MODEL`, etc.) to experiment with different LLMs.
+
+---
+
+## Acknowledgements
+
+This project is inspired by recent advances in **RAG**, **reflective agents**, and open-source LLMs. Thanks to the open-source community for making this work possible.
